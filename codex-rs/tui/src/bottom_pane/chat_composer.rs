@@ -30,6 +30,7 @@ use crate::bottom_pane::textarea::TextArea;
 use crate::bottom_pane::textarea::TextAreaState;
 use codex_file_search::FileMatch;
 use std::cell::RefCell;
+use unicode_width::UnicodeWidthStr;
 
 const BASE_PLACEHOLDER_TEXT: &str = "Ask Codex to do anything";
 /// If the pasted content exceeds this number of characters, replace it with a
@@ -61,6 +62,9 @@ pub(crate) struct ChatComposer {
     pending_pastes: Vec<(String, String)>,
     token_usage_info: Option<TokenUsageInfo>,
     has_focus: bool,
+    vscode_selection_hint: Option<(usize, String)>,
+    ide_connected: bool,
+    ide_detected: bool,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -91,6 +95,9 @@ impl ChatComposer {
             pending_pastes: Vec::new(),
             token_usage_info: None,
             has_focus: has_input_focus,
+            vscode_selection_hint: None,
+            ide_connected: false,
+            ide_detected: false,
         }
     }
 
@@ -116,6 +123,14 @@ impl ChatComposer {
         textarea_rect.x += 1;
         let state = self.textarea_state.borrow();
         self.textarea.cursor_pos_with_state(textarea_rect, &state)
+    }
+
+    pub(crate) fn set_ide_connected(&mut self, connected: bool) {
+        self.ide_connected = connected;
+    }
+
+    pub(crate) fn set_ide_detected(&mut self, detected: bool) {
+        self.ide_detected = detected;
     }
 
     /// Returns true if the composer currently contains no user input.
@@ -649,6 +664,17 @@ impl ChatComposer {
     fn set_has_focus(&mut self, has_focus: bool) {
         self.has_focus = has_focus;
     }
+
+    pub(crate) fn set_vscode_selection_hint(
+        &mut self,
+        lines: Option<usize>,
+        rel_path: Option<String>,
+    ) {
+        self.vscode_selection_hint = match (lines, rel_path) {
+            (Some(n), Some(p)) if n > 0 && !p.is_empty() => Some((n, p)),
+            _ => None,
+        };
+    }
 }
 
 impl WidgetRef for &ChatComposer {
@@ -670,7 +696,14 @@ impl WidgetRef for &ChatComposer {
             ActivePopup::None => {
                 let bottom_line_rect = popup_rect;
                 let key_hint_style = Style::default().fg(Color::Cyan);
-                let mut hint = if self.ctrl_c_quit_hint {
+                let mut hint = if let Some((n, path)) = self.vscode_selection_hint.as_ref() {
+                    let label = if *n == 1 { "line" } else { "lines" };
+                    vec![
+                        Span::from(" "),
+                        Span::from(format!("{n} {label} in {path} highlighted in VS Code"))
+                            .style(Style::default().fg(Color::Yellow)),
+                    ]
+                } else if self.ctrl_c_quit_hint {
                     vec![
                         Span::from(" "),
                         "Ctrl+C again".set_style(key_hint_style),
@@ -719,9 +752,24 @@ impl WidgetRef for &ChatComposer {
                     }
                 }
 
-                Line::from(hint)
-                    .style(Style::default().dim())
-                    .render_ref(bottom_line_rect, buf);
+                {
+                    // Render left-side hint first
+                    let line = Line::from(hint).style(Style::default().dim());
+                    line.render_ref(bottom_line_rect, buf);
+
+                    // Right-aligned IDE indicator
+                    if self.ide_detected {
+                        let dot = if self.ide_connected { "●" } else { "○" };
+                        let indicator = format!("{dot} VS Code");
+                        let iw = indicator.width() as u16;
+                        let x = if iw < bottom_line_rect.width {
+                            bottom_line_rect.x + bottom_line_rect.width - iw
+                        } else {
+                            bottom_line_rect.x
+                        };
+                        buf.set_string(x, bottom_line_rect.y, indicator, Style::default().dim());
+                    }
+                }
             }
         }
         Block::default()

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_apply_patch::ApplyPatchFileChange;
+use codex_apply_patch::maybe_parse_apply_patch_verified;
 use codex_core::codex_wrapper::CodexConversation;
 use codex_core::codex_wrapper::init_codex;
 use codex_core::config::Config;
@@ -40,6 +42,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use tracing::info;
 
 use crate::app_event::AppEvent;
+use crate::app_event::VscodeSelectionInfo;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
@@ -52,6 +55,22 @@ use crate::live_wrap::RowBuilder;
 use crate::user_approval_widget::ApprovalRequest;
 use codex_file_search::FileMatch;
 use ratatui::style::Stylize;
+use std::collections::VecDeque;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use std::process::Command;
+use std::process::Stdio;
+#[cfg(windows)]
+use tokio::io::AsyncBufReadExt;
+#[cfg(windows)]
+use tokio::io::AsyncWriteExt;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
+#[cfg(windows)]
+use tokio::runtime::Runtime;
 
 struct RunningCommand {
     command: Vec<String>,
@@ -60,9 +79,9 @@ struct RunningCommand {
 }
 
 pub(crate) struct ChatWidget<'a> {
-    app_event_tx: AppEventSender,
+    pub(crate) app_event_tx: AppEventSender,
     codex_op_tx: UnboundedSender<Op>,
-    bottom_pane: BottomPane<'a>,
+    pub(crate) bottom_pane: BottomPane<'a>,
     active_history_cell: Option<HistoryCell>,
     config: Config,
     initial_user_message: Option<UserMessage>,
@@ -79,11 +98,219 @@ pub(crate) struct ChatWidget<'a> {
     current_stream: Option<StreamKind>,
     stream_header_emitted: bool,
     live_max_rows: u16,
+    vscode_selection: Option<VscodeSelectionInfo>,
+    ipc_tx: Option<std::sync::mpsc::Sender<String>>,
+}
+
+// --------------------- IPC helpers (platform-agnostic wrappers) ---------------------
+
+fn selection_from_json(v: &serde_json::Value) -> Option<VscodeSelectionInfo> {
+    let lines = v.get("lines").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let characters = v.get("characters").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let text = v
+        .get("text")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let rel_path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let language_id = v
+        .get("languageId")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let start_line = v.get("startLine").and_then(|x| x.as_u64());
+    let end_line = v.get("endLine").and_then(|x| x.as_u64());
+    Some(VscodeSelectionInfo {
+        lines,
+        characters,
+        text,
+        rel_path,
+        language_id,
+        start_line,
+        end_line,
+    })
+}
+
+fn dispatch_selection_from_str(app_event_tx: &crate::app_event_sender::AppEventSender, data: &str) {
+    let evt = match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(v) => {
+            if v.get("type").and_then(|t| t.as_str()) == Some("selection") {
+                Some(crate::app_event::AppEvent::VscodeSelectionUpdate(
+                    selection_from_json(&v),
+                ))
+            } else {
+                Some(crate::app_event::AppEvent::VscodeSelectionUpdate(
+                    selection_from_json(&v),
+                ))
+            }
+        }
+        Err(_) => Some(crate::app_event::AppEvent::VscodeSelectionUpdate(None)),
+    };
+    if let Some(evt) = evt {
+        app_event_tx.send(evt);
+    }
+}
+
+#[cfg(unix)]
+fn start_ipc_reader(path: &str, app_event_tx: crate::app_event_sender::AppEventSender) -> bool {
+    let p = path.to_string();
+    std::thread::spawn(move || {
+        loop {
+            match UnixStream::connect(&p) {
+                Ok(stream) => {
+                    // Set footer hint: IDE connected
+                    app_event_tx.send(AppEvent::LatestLog(String::from("__SET_IDE_CONNECTED__")));
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let n = reader.read_line(&mut line).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        let trimmed = line.trim_end_matches(['\n', '\r']);
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        dispatch_selection_from_str(&app_event_tx, trimmed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+    });
+    true
+}
+
+#[cfg(windows)]
+fn start_ipc_reader(path: &str, app_event_tx: crate::app_event_sender::AppEventSender) -> bool {
+    let pipe_path = path.to_string();
+    std::thread::spawn(move || {
+        let rt = Runtime::new().expect("tokio rt");
+        rt.block_on(async move {
+            loop {
+                match ClientOptions::new().open(&pipe_path) {
+                    Ok(client) => {
+                        // Set footer hint: IDE connected
+                        app_event_tx
+                            .send(AppEvent::LatestLog(String::from("__SET_IDE_CONNECTED__")));
+                        let mut reader = tokio::io::BufReader::new(client);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            let n = reader.read_line(&mut line).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            let trimmed = line.trim_end_matches(['\n', '\r']);
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            dispatch_selection_from_str(&app_event_tx, trimmed);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        });
+    });
+    true
+}
+
+#[cfg(unix)]
+fn make_ipc_writer(path: &str) -> Option<std::sync::mpsc::Sender<String>> {
+    let p = path.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut backlog: VecDeque<String> = VecDeque::new();
+        let mut stream: Option<UnixStream> = None;
+        loop {
+            if backlog.is_empty() {
+                match rx.recv() {
+                    Ok(line) => backlog.push_back(line),
+                    Err(_) => break,
+                }
+            }
+            while stream.is_none() {
+                match UnixStream::connect(&p) {
+                    Ok(s) => stream = Some(s),
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                }
+            }
+            while let Some(line) = backlog.pop_front() {
+                if let Some(s) = stream.as_mut() {
+                    if s.write_all(line.as_bytes()).is_err()
+                        || s.write_all(b"\n").is_err()
+                        || s.flush().is_err()
+                    {
+                        stream = None;
+                        backlog.push_front(line);
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Some(tx)
+}
+
+#[cfg(windows)]
+fn make_ipc_writer(path: &str) -> Option<std::sync::mpsc::Sender<String>> {
+    let pipe_path = path.to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let rt = Runtime::new().expect("tokio rt");
+        rt.block_on(async move {
+            let mut backlog: VecDeque<String> = VecDeque::new();
+            let mut client: Option<tokio::net::windows::named_pipe::NamedPipeClient> = None;
+            loop {
+                if backlog.is_empty() {
+                    match rx.recv() {
+                        Ok(line) => backlog.push_back(line),
+                        Err(_) => break,
+                    }
+                }
+                while client.is_none() {
+                    match ClientOptions::new().open(&pipe_path) {
+                        Ok(c) => client = Some(c),
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        }
+                    }
+                }
+                while let Some(line) = backlog.pop_front() {
+                    if let Some(c) = client.as_mut() {
+                        if c.write_all(line.as_bytes()).await.is_err()
+                            || c.write_all(b"\n").await.is_err()
+                            || c.flush().await.is_err()
+                        {
+                            client = None;
+                            backlog.push_front(line);
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    });
+    Some(tx)
 }
 
 struct UserMessage {
     text: String,
     image_paths: Vec<PathBuf>,
+    extra_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +324,7 @@ impl From<String> for UserMessage {
         Self {
             text,
             image_paths: Vec::new(),
+            extra_text: None,
         }
     }
 }
@@ -105,11 +333,125 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
     if text.is_empty() && image_paths.is_empty() {
         None
     } else {
-        Some(UserMessage { text, image_paths })
+        Some(UserMessage {
+            text,
+            image_paths,
+            extra_text: None,
+        })
     }
 }
 
 impl ChatWidget<'_> {
+    fn vscode_extension_active(&self) -> bool {
+        let marker = self.config.codex_home.join("ide").join("extension.json");
+        marker.exists()
+    }
+
+    /// Best-effort: if running inside a VS Code terminal, attempt to
+    /// install or update the Codex VS Code extension so IPC can work.
+    /// This runs non-blocking in a background thread and is safe to call
+    /// during UI startup. Failures are logged but ignored.
+    fn maybe_autoinstall_vscode_extension(&self) {
+        // Only try inside VS Code terminal to avoid surprising installs.
+        let in_vscode_term = std::env::var("TERM_PROGRAM")
+            .map(|v| v == "vscode")
+            .unwrap_or(false)
+            || std::env::var("VSCODE_PID").is_ok();
+        if !in_vscode_term {
+            return;
+        }
+
+        // If the extension already looks active (marker present), skip.
+        if self.vscode_extension_active() {
+            return;
+        }
+
+        // Spawn a detached worker so we never block the UI thread.
+        std::thread::spawn(move || {
+            // Prefer the VS Code stable CLI; fall back to insiders.
+            let candidates: &[&str] = if cfg!(windows) {
+                &[
+                    "code.cmd",
+                    "code-insiders.cmd",
+                    "code.exe",
+                    "code-insiders.exe",
+                ]
+            } else {
+                &["code", "code-insiders"]
+            };
+
+            // Helper to check if invoking the CLI succeeds for a quick no-op command.
+            let mut chosen: Option<&str> = None;
+            for c in candidates {
+                let ok = Command::new(c)
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok {
+                    chosen = Some(*c);
+                    break;
+                }
+            }
+            let Some(cli) = chosen else { return };
+
+            // Check if extension exists and version via `--list-extensions --show-versions`.
+            // If missing or outdated, install/update with --force.
+            let list_out = Command::new(cli)
+                .args(["--list-extensions", "--show-versions"])
+                .output();
+            let need_install_or_update = match list_out {
+                Ok(out) => {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    // Example lines: "openai.codex-vscode@0.0.1"
+                    let mut found: Option<String> = None;
+                    for line in s.lines() {
+                        if let Some(rest) = line.strip_prefix("openai.codex-vscode@") {
+                            found = Some(rest.trim().to_string());
+                            break;
+                        }
+                        if line.trim() == "openai.codex-vscode" {
+                            found = Some(String::from("0.0.0"));
+                            break;
+                        }
+                    }
+                    match found {
+                        None => true,
+                        Some(installed_ver) => {
+                            // Minimal semver compare against the required version.
+                            // Bump this when the extension requires a newer protocol.
+                            const REQUIRED: &str = "0.0.1";
+                            fn parse(v: &str) -> (u64, u64, u64) {
+                                let mut it = v.split('.');
+                                let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                                let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                                let c = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                                (a, b, c)
+                            }
+                            parse(&installed_ver) < parse(REQUIRED)
+                        }
+                    }
+                }
+                Err(_) => true,
+            };
+
+            if need_install_or_update {
+                let _ = Command::new(cli)
+                    .args(["--install-extension", "openai.codex-vscode", "--force"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        });
+    }
+
+    fn write_proposed_patch_json(&self, payload: serde_json::Value) {
+        if let Some(tx) = &self.ipc_tx {
+            let _ = tx.send(payload.to_string());
+        }
+    }
     fn interrupt_running_task(&mut self) {
         if self.bottom_pane.is_task_running() {
             self.active_history_cell = None;
@@ -200,7 +542,29 @@ impl ChatWidget<'_> {
             }
         });
 
-        Self {
+        // Set up VS Code selection integration
+        {
+            let ide_dir = config.codex_home.join("ide");
+            let _selection_file = ide_dir.join("selection.json");
+            let _ = std::fs::create_dir_all(&ide_dir);
+            let ext_marker = ide_dir.join("extension.json");
+            let _app_evt_for_fallback = app_event_tx.clone();
+            let _started_ipc = false;
+            let ipc_path = std::fs::read_to_string(&ext_marker)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("ipc_path")
+                        .and_then(|x| x.as_str().map(|s| s.to_string()))
+                });
+            if let Some(path) = ipc_path.as_deref() {
+                if start_ipc_reader(path, app_event_tx.clone()) {
+                    let _ = true; // mark connected in this branch
+                }
+            }
+        }
+
+        let mut s = Self {
             app_event_tx: app_event_tx.clone(),
             codex_op_tx,
             bottom_pane: BottomPane::new(BottomPaneParams {
@@ -209,7 +573,7 @@ impl ChatWidget<'_> {
                 enhanced_keys_supported,
             }),
             active_history_cell: None,
-            config,
+            config: config.clone(),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
                 initial_images,
@@ -224,7 +588,27 @@ impl ChatWidget<'_> {
             current_stream: None,
             stream_header_emitted: false,
             live_max_rows: 3,
+            vscode_selection: None,
+            ipc_tx: {
+                let ide_dir2 = config.codex_home.clone().join("ide");
+                let ext_marker2 = ide_dir2.join("extension.json");
+                std::fs::read_to_string(&ext_marker2)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get("ipc_path")
+                            .and_then(|x| x.as_str().map(|s| s.to_string()))
+                    })
+                    .and_then(|path| make_ipc_writer(&path))
+            },
+        };
+        if s.vscode_extension_active() {
+            s.bottom_pane.set_ide_detected(true);
         }
+        // Fire-and-forget autoinstall if running in VS Code terminal
+        // and the extension doesn't appear active yet.
+        s.maybe_autoinstall_vscode_extension();
+        s
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
@@ -242,7 +626,41 @@ impl ChatWidget<'_> {
 
         match self.bottom_pane.handle_key_event(key_event) {
             InputResult::Submitted(text) => {
-                self.submit_user_message(text.into());
+                // Prepare extra, invisible context from VS Code selection without
+                // showing it in the user's visible message/history.
+                let mut extra: Option<String> = None;
+                if let Some(sel) = &self.vscode_selection {
+                    if sel.lines > 0 {
+                        let lang = sel
+                            .language_id
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .filter(|s| {
+                                !s.is_empty()
+                                    && s.chars()
+                                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                            })
+                            .unwrap_or("");
+                        let header = if let Some(p) = &sel.rel_path {
+                            match (sel.start_line, sel.end_line) {
+                                (Some(s), Some(e)) => format!("From {}:L{}-L{}\n", p, s, e),
+                                _ => format!("From {}\n", p),
+                            }
+                        } else {
+                            "Selected code:\n".to_string()
+                        };
+                        let code = sel
+                            .text
+                            .as_deref()
+                            .unwrap_or("")
+                            .replace("```", "\u{0060}\u{0060}\u{0060}");
+                        let block = format!("```{}\n{}\n```\n", lang, code);
+                        extra = Some(format!("{}{}", header, block));
+                    }
+                }
+                let mut um: UserMessage = text.into();
+                um.extra_text = extra;
+                self.submit_user_message(um);
             }
             InputResult::None => {}
         }
@@ -252,17 +670,36 @@ impl ChatWidget<'_> {
         self.bottom_pane.handle_paste(text);
     }
 
+    pub(crate) fn set_vscode_selection(&mut self, sel: Option<VscodeSelectionInfo>) {
+        let lines = sel.as_ref().map(|s| s.lines).filter(|v| *v > 0);
+        let rel_path = sel.as_ref().and_then(|s| s.rel_path.clone());
+        self.bottom_pane.set_vscode_selection_hint(lines, rel_path);
+        self.vscode_selection = sel;
+    }
+
     fn add_to_history(&mut self, cell: HistoryCell) {
         self.app_event_tx
             .send(AppEvent::InsertHistory(cell.plain_lines()));
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
-        let UserMessage { text, image_paths } = user_message;
+        let UserMessage {
+            text,
+            image_paths,
+            extra_text,
+        } = user_message;
         let mut items: Vec<InputItem> = Vec::new();
 
         if !text.is_empty() {
             items.push(InputItem::Text { text: text.clone() });
+        }
+
+        if let Some(extra) = extra_text.as_ref() {
+            if !extra.is_empty() {
+                items.push(InputItem::Text {
+                    text: extra.clone(),
+                });
+            }
         }
 
         for path in image_paths {
@@ -398,6 +835,65 @@ impl ChatWidget<'_> {
                 reason,
             }) => {
                 self.finalize_active_stream();
+                // If this exec is an apply_patch invocation, surface a structured
+                // apply_patch payload so the VS Code extension can show diffs while
+                // the user decides to approve or deny execution.
+                if self.vscode_extension_active() {
+                    let detected = match maybe_parse_apply_patch_verified(&command, &cwd) {
+                        codex_apply_patch::MaybeApplyPatchVerified::Body(action) => Some(action),
+                        _ => {
+                            // Fallback for codex --codex-run-as-apply-patch '<patch>' shape
+                            if command.len() >= 3
+                                && command.get(1).map(|s| s.as_str())
+                                    == Some(codex_core::CODEX_APPLY_PATCH_ARG1)
+                            {
+                                let shim = vec!["apply_patch".to_string(), command[2].clone()];
+                                match maybe_parse_apply_patch_verified(&shim, &cwd) {
+                                    codex_apply_patch::MaybeApplyPatchVerified::Body(action) => {
+                                        Some(action)
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(action) = detected {
+                        let mut changes: HashMap<
+                            std::path::PathBuf,
+                            codex_core::protocol::FileChange,
+                        > = HashMap::new();
+                        for (p, ch) in action.changes() {
+                            let v = match ch {
+                                ApplyPatchFileChange::Add { content } => {
+                                    codex_core::protocol::FileChange::Add {
+                                        content: content.clone(),
+                                    }
+                                }
+                                ApplyPatchFileChange::Delete => {
+                                    codex_core::protocol::FileChange::Delete
+                                }
+                                ApplyPatchFileChange::Update {
+                                    unified_diff,
+                                    move_path,
+                                    new_content: _,
+                                } => codex_core::protocol::FileChange::Update {
+                                    unified_diff: unified_diff.clone(),
+                                    move_path: move_path.clone(),
+                                },
+                            };
+                            changes.insert(p.clone(), v);
+                        }
+                        let payload = serde_json::json!({
+                            "type": "apply_patch",
+                            "changes": changes,
+                            "title": "Proposed Patch",
+                            "cwd": cwd,
+                        });
+                        self.write_proposed_patch_json(payload);
+                    }
+                }
                 let request = ApprovalRequest::Exec {
                     id,
                     command,
@@ -408,12 +904,25 @@ impl ChatWidget<'_> {
                 self.request_redraw();
             }
             EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
-                call_id: _,
+                call_id,
                 changes,
                 reason,
                 grant_root,
             }) => {
                 self.finalize_active_stream();
+                if self.vscode_extension_active() {
+                    // Mirror payload for the VS Code extension
+                    // Provide a helpful title; extension will also show per-file diffs for updates.
+                    let payload = serde_json::json!({
+                        "type": "apply_patch",
+                        "call_id": call_id,
+                        "changes": changes,
+                        "reason": reason,
+                        "grant_root": grant_root,
+                        "title": "Proposed Patch",
+                    });
+                    self.write_proposed_patch_json(payload);
+                }
                 // ------------------------------------------------------------------
                 // Before we even prompt the user for approval we surface the patch
                 // summary in the main conversation so that the dialog appears in a
@@ -472,6 +981,17 @@ impl ChatWidget<'_> {
             EventMsg::PatchApplyEnd(event) => {
                 if !event.success {
                     self.add_to_history(HistoryCell::new_patch_apply_failure(event.stderr));
+                }
+                // Notify VS Code extension about patch status
+                if self.vscode_extension_active() {
+                    let payload = serde_json::json!({
+                        "type": "patch_applied",
+                        "success": event.success,
+                        "call_id": event.call_id,
+                    });
+                    if let Some(tx) = &self.ipc_tx {
+                        let _ = tx.send(payload.to_string());
+                    }
                 }
             }
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
@@ -532,7 +1052,16 @@ impl ChatWidget<'_> {
                 self.app_event_tx.send(AppEvent::ExitRequest);
             }
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => {
-                info!("TurnDiffEvent: {unified_diff}");
+                if self.vscode_extension_active() {
+                    let payload = serde_json::json!({
+                        "type": "turn_diff",
+                        "unified_diff": unified_diff,
+                        "title": "Turn Diff",
+                    });
+                    self.write_proposed_patch_json(payload);
+                } else {
+                    info!("TurnDiffEvent: {unified_diff}");
+                }
             }
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 info!("BackgroundEvent: {message}");

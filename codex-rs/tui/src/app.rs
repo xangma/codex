@@ -307,9 +307,19 @@ impl App<'_> {
                     AppState::Onboarding { .. } => {}
                 },
                 AppEvent::LatestLog(line) => match &mut self.app_state {
-                    AppState::Chat { widget } => widget.update_latest_log(line),
+                    AppState::Chat { widget } => {
+                        if line == "__SET_IDE_CONNECTED__" {
+                            widget.bottom_pane.set_ide_connected(true);
+                            self.app_event_tx.send(AppEvent::RequestRedraw);
+                        } else {
+                            widget.update_latest_log(line)
+                        }
+                    }
                     AppState::Onboarding { .. } => {}
                 },
+                AppEvent::VscodeSelectionUpdate(sel) => {
+                    self.dispatch_vscode_selection(sel);
+                }
                 AppEvent::DispatchCommand(command) => match command {
                     SlashCommand::New => {
                         // User accepted – switch to chat view.
@@ -546,6 +556,13 @@ impl App<'_> {
     fn dispatch_codex_event(&mut self, event: Event) {
         match &mut self.app_state {
             AppState::Chat { widget } => widget.handle_codex_event(event),
+            AppState::Onboarding { .. } => {}
+        }
+    }
+
+    fn dispatch_vscode_selection(&mut self, sel: Option<crate::app_event::VscodeSelectionInfo>) {
+        match &mut self.app_state {
+            AppState::Chat { widget } => widget.set_vscode_selection(sel),
             AppState::Onboarding { .. } => {}
         }
     }

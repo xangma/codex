@@ -196,6 +196,27 @@ impl BottomPane<'_> {
         }
     }
 
+    /// IDE bridge: update VS Code selection line count hint.
+    pub(crate) fn set_vscode_selection_hint(
+        &mut self,
+        lines: Option<usize>,
+        rel_path: Option<String>,
+    ) {
+        self.composer.set_vscode_selection_hint(lines, rel_path);
+        self.request_redraw();
+    }
+
+    /// IDE bridge: set connection state for footer hint.
+    pub(crate) fn set_ide_connected(&mut self, connected: bool) {
+        self.composer.set_ide_connected(connected);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_ide_detected(&mut self, detected: bool) {
+        self.composer.set_ide_detected(detected);
+        self.request_redraw();
+    }
+
     /// Update the status indicator text. Prefer replacing the composer with
     /// the StatusIndicatorView so the input pane shows a single-line status
     /// like: `▌ Working waiting for model`.

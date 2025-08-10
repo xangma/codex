@@ -869,6 +869,7 @@ dependencies = [
  "chrono",
  "clap",
  "codex-ansi-escape",
+ "codex-apply-patch",
  "codex-arg0",
  "codex-common",
  "codex-core",

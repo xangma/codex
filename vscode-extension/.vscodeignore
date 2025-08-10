@@ -1,0 +1,12 @@
+**/.git
+**/.svn
+**/.hg
+**/CVS
+**/.DS_Store
+**/node_modules
+**/src
+**/.vscode
+**/*.map
+**/*.ts
+**/*.tsx
+

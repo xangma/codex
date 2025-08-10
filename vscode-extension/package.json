@@ -1,0 +1,65 @@
+{
+  "name": "codex-vscode",
+  "displayName": "Codex",
+  "description": "Open a new editor group, create a terminal at the workspace root, and run codex.",
+  "publisher": "openai",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "main": "extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:codex.openNewGroupAndRun",
+    "onCommand:codex.pasteSelectionToCodex",
+    "onCommand:codex.runSelfTests"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Codex",
+      "properties": {}
+    },
+    "commands": [
+      {
+        "command": "codex.openNewGroupAndRun",
+        "title": "Codex"
+      },
+      {
+        "command": "codex.pasteSelectionToCodex",
+        "title": "Codex: Paste Selection to Composer",
+        "icon": "$(quote)"
+      },
+      {
+        "command": "codex.runSelfTests",
+        "title": "Codex: Run Extension Self-Tests",
+        "icon": "$(beaker)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "codex.openNewGroupAndRun",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "command": "codex.runSelfTests",
+          "when": "codex.devMode == true"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "codex.openNewGroupAndRun",
+          "group": "navigation@1",
+          "when": "true"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vsce:package": "vsce package"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.2.1"
+  }
+}

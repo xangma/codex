@@ -6,6 +6,18 @@ use ratatui::text::Line;
 use crate::app::ChatWidgetArgs;
 use crate::slash_command::SlashCommand;
 
+#[derive(Clone, Debug)]
+pub(crate) struct VscodeSelectionInfo {
+    pub lines: usize,
+    #[allow(unused)]
+    pub characters: usize,
+    pub text: Option<String>,
+    pub rel_path: Option<String>,
+    pub language_id: Option<String>,
+    pub start_line: Option<u64>,
+    pub end_line: Option<u64>,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum AppEvent {
     CodexEvent(Event),
@@ -49,6 +61,10 @@ pub(crate) enum AppEvent {
     },
 
     InsertHistory(Vec<Line<'static>>),
+
+    /// Live update from IDE integrations (e.g., VS Code) about current selection.
+    /// Use `lines` for the footer hint; inject `text` into the next user message.
+    VscodeSelectionUpdate(Option<VscodeSelectionInfo>),
 
     /// Onboarding: result of login_with_chatgpt.
     OnboardingAuthComplete(Result<(), String>),
